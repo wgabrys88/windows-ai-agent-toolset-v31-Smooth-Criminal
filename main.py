@@ -1,9 +1,9 @@
-
 # main.py
 """FRANZ - AI-driven Windows automation agent with smooth, human-like interactions."""
 
 import base64
 import ctypes
+import ctypes.wintypes
 import json
 import re
 import time
@@ -30,36 +30,38 @@ CLICK_SETTLE_DELAY: Final = 0.15  # Pause after arriving before clicking
 TYPING_CHAR_DELAY: Final = 0.08  # 80ms between characters (realistic typing)
 TYPING_WORD_DELAY: Final = 0.15  # 150ms pause after spaces (thinking)
 
-SYSTEM_PROMPT: Final = """You are FRANZ, a Windows controller. Analyze the screenshot and respond with exactly one ```python block containing:
+SYSTEM_PROMPT: Final = """
+You are a visual interpreter with storytelling power that processes visual data into meaningful insights that guide human actions, a narrator of system state, reasoning through what's shown to help the user move forward.
 
-Available commands (one per line):
-- click X Y          (left click at normalized coords 0-1000)
-- rightclick X Y     (right click at normalized coords 0-1000)
-- doubleclick X Y    (double left click at normalized coords 0-1000)
-- drag X1 Y1 X2 Y2   (drag from start to end coords)
-- type TEXT          (type text with keyboard, use quotes if spaces: type "hello world")
+Your internal process:
+- see (components),
+- understand (behavior and context),
+- tell a story that explains why something matters,
+- give actionable advice, based on that narrative.
 
-Add a triple-quoted docstring with STORY_START/STORY_END (max 150 chars story).
+Using below python functions, to interact with the computer: (values: 0-1000 normalized coords)
+left_click(x,y)
+right_click(x,y)
+double_left_click(x,y)
+drag(start_pos_x,start_pos_y,end_pos_x,end_pos_y)
+type(text)
 
-Example:
-```python
-click 500 300
-type "hello"
-rightclick 600 400
-\"\"\"
-STORY_START
-I clicked the search box and typed hello, then right-clicked the result.
-STORY_END
-\"\"\"
-```
+Output:
+- guaranteed single step toward directing the User towards their ultimate goal.
+- 3 sentences narrative story explaining why that recommendation is logical and what is the expected outcome
+"""
 
-Keep simple. Sometimes just observe (story only, no commands)."""
+USER_PROMPT_TEMPLATE: Final = """
+I want to draw a cat in ms paint, then save it on desktop as a "cat.jpg" file, start an iterative process (a story) that will bring me iteratively step-by-step towards my end goal.
 
-USER_PROMPT_TEMPLATE: Final = """Current story:
+Current story so far:
 {story}
 
-Last action:
-{last}"""
+Last action performed:
+{last}
+
+Look at the current screenshot and decide the single next action to take. Output exactly one function call inside a ```python``` code block, followed by your 3-sentence narrative story.
+"""
 
 
 def infer(png_data: bytes, story: str, last: str) -> str:
@@ -83,75 +85,87 @@ def infer(png_data: bytes, story: str, last: str) -> str:
         ],
         **SAMPLING,
     }
-    
+
     req = urllib.request.Request(
         API,
         json.dumps(payload).encode(),
         {"Content-Type": "application/json"},
     )
-    
+
     with urllib.request.urlopen(req) as f:
         return json.load(f)["choices"][0]["message"]["content"]
 
 
-def parse_response(content: str) -> tuple[list[str], str]:
-    """Parse AI response for commands and story."""
-    fence = re.search(r"```(?:python)?\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
-    block = fence.group(1) if fence else content
-    
-    # Extract story from triple-quoted string
-    doc = re.search(r'("""|' + r"''')(?P<body>.*?)(\\1)", block, re.DOTALL)
-    if doc and "STORY_START" in doc["body"] and "STORY_END" in doc["body"]:
-        if story_match := re.search(r"STORY_START(.*?)STORY_END", doc["body"], re.DOTALL):
-            story = story_match.group(1).strip()
-        else:
-            story = doc["body"].strip()
-        commands = [ln.strip() for ln in block.splitlines() if ln.strip() and not ln.strip().startswith(('"""', "'''", "#"))]
-        commands = [cmd for cmd in commands if cmd.lower().split()[0] in ("click", "rightclick", "doubleclick", "drag", "type")]
-        return commands, story
-    
-    # Try to extract story without docstring
-    if story_match := re.search(r"STORY_START(.*?)STORY_END", block, re.DOTALL):
-        story = story_match.group(1).strip()
-        commands = [ln.strip() for ln in block.splitlines() if ln.strip() and ln.strip().lower().split()[0] in ("click", "rightclick", "doubleclick", "drag", "type")]
-        return commands, story
-    
-    # Just extract commands
-    commands = [ln.strip() for ln in block.splitlines() if ln.strip() and ln.strip().lower().split()[0] in ("click", "rightclick", "doubleclick", "drag", "type")]
-    return commands, ""
+# Regex matching function calls: left_click(500,300), type("hello world"), drag(10,20,30,40), etc.
+_FUNC_CALL_RE = re.compile(
+    r"\b(left_click|right_click|double_left_click|drag|type)\s*\(([^)]*)\)"
+)
 
 
-def parse_action(cmd: str) -> tuple[str, list]:
-    """Parse action type and parameters from command.
-    
+def parse_response(content: str) -> tuple[list[tuple[str, list]], str]:
+    """Parse AI response for commands and story.
+
     Returns:
-        Tuple of (action_type, parameters)
+        Tuple of (list of (action_name, params), narrative_story_text)
     """
-    parts = cmd.strip().split(None, 1)
-    if not parts:
-        return "unknown", []
-    
-    action = parts[0].lower()
-    
-    if action in ("click", "rightclick", "doubleclick"):
-        coords = parts[1].split() if len(parts) > 1 else []
-        if len(coords) >= 2:
-            return action, [int(coords[0]), int(coords[1])]
-    
-    elif action == "drag":
-        coords = parts[1].split() if len(parts) > 1 else []
-        if len(coords) >= 4:
-            return action, [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])]
-    
-    elif action == "type":
-        if len(parts) > 1:
-            text = parts[1]
-            # Remove surrounding quotes if present
-            if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
-                text = text[1:-1]
-            return action, [text]
-    
-    return "unknown", []
+    # Try to extract from a fenced code block first
+    fence = re.search(r"```(?:python)?\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
+    code_block = fence.group(1) if fence else content
+
+    # Find all function calls
+    commands: list[tuple[str, list]] = []
+    for match in _FUNC_CALL_RE.finditer(code_block):
+        func_name = match.group(1)
+        raw_args = match.group(2).strip()
+        params = _parse_args(func_name, raw_args)
+        if params is not None:
+            commands.append((func_name, params))
+
+    # Extract narrative: everything outside the code fence, or non-function-call lines
+    if fence:
+        story_parts = []
+        # Text before the code block
+        before = content[:fence.start()].strip()
+        if before:
+            story_parts.append(before)
+        # Text after the code block
+        after = content[fence.end():].strip()
+        if after:
+            story_parts.append(after)
+        story = "\n".join(story_parts).strip()
+    else:
+        # No code fence — take lines that aren't function calls
+        story_lines = []
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped and not _FUNC_CALL_RE.search(stripped):
+                story_lines.append(stripped)
+        story = " ".join(story_lines).strip()
+
+    # Clean up common markdown/comment artifacts from story
+    story = re.sub(r"^[#*>\-]+\s*", "", story, flags=re.MULTILINE).strip()
+
+    return commands, story
+
+
+def _parse_args(func_name: str, raw_args: str) -> list | None:
+    """Parse raw argument string into a typed parameter list."""
+    if func_name == "type":
+        # Expect a single string argument, possibly quoted
+        text = raw_args.strip()
+        if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+            text = text[1:-1]
+        return [text] if text else None
+
+    # All other commands expect numeric arguments
+    nums = re.findall(r"-?\d+", raw_args)
+
+    if func_name in ("left_click", "right_click", "double_left_click") and len(nums) >= 2:
+        return [int(nums[0]), int(nums[1])]
+    elif func_name == "drag" and len(nums) >= 4:
+        return [int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3])]
+
+    return None
 
 
 def create_visualization(last_action: str) -> callable:
@@ -159,22 +173,31 @@ def create_visualization(last_action: str) -> callable:
     def draw_annotations(rgba: bytes, width: int, height: int) -> bytes:
         if not ENABLE_VISUAL_FEEDBACK or last_action in ("init", "observe"):
             return rgba
-        
-        action_type, params = parse_action(last_action)
-        
-        if action_type in ("click", "doubleclick") and len(params) == 2:
+
+        # Try to parse the last action as a function call
+        match = _FUNC_CALL_RE.search(last_action)
+        if not match:
+            return rgba
+
+        func_name = match.group(1)
+        raw_args = match.group(2).strip()
+        params = _parse_args(func_name, raw_args)
+        if params is None:
+            return rgba
+
+        if func_name in ("left_click", "double_left_click") and len(params) == 2:
             x = drawing.normalize_coord(params[0], width)
             y = drawing.normalize_coord(params[1], height)
             rgba = drawing.draw_crosshair(rgba, width, height, x, y, size=25, color=drawing.RED, thickness=3)
             rgba = drawing.draw_circle(rgba, width, height, x, y, radius=40, color=drawing.GREEN, filled=False)
-        
-        elif action_type == "rightclick" and len(params) == 2:
+
+        elif func_name == "right_click" and len(params) == 2:
             x = drawing.normalize_coord(params[0], width)
             y = drawing.normalize_coord(params[1], height)
             rgba = drawing.draw_crosshair(rgba, width, height, x, y, size=25, color=drawing.BLUE, thickness=3)
             rgba = drawing.draw_circle(rgba, width, height, x, y, radius=40, color=drawing.YELLOW, filled=False)
-        
-        elif action_type == "drag" and len(params) == 4:
+
+        elif func_name == "drag" and len(params) == 4:
             x1 = drawing.normalize_coord(params[0], width)
             y1 = drawing.normalize_coord(params[1], height)
             x2 = drawing.normalize_coord(params[2], width)
@@ -182,9 +205,9 @@ def create_visualization(last_action: str) -> callable:
             rgba = drawing.draw_arrow(rgba, width, height, x1, y1, x2, y2, color=drawing.BLUE, thickness=4)
             rgba = drawing.draw_circle(rgba, width, height, x1, y1, radius=15, color=drawing.YELLOW, filled=True)
             rgba = drawing.draw_circle(rgba, width, height, x2, y2, radius=15, color=drawing.GREEN, filled=True)
-        
+
         return rgba
-    
+
     return draw_annotations
 
 
@@ -198,15 +221,15 @@ def get_cursor_position() -> tuple[int, int]:
 def smooth_move_to(target_x: int, target_y: int, steps: int = MOVEMENT_STEPS, delay: float = STEP_DELAY) -> None:
     """Smoothly move cursor from current position to target position."""
     start_x, start_y = get_cursor_position()
-    
+
     for i in range(steps + 1):
         t = i / steps
         # Ease-in-out interpolation for more natural movement
         t = t * t * (3 - 2 * t)  # Smoothstep function
-        
+
         x = int(start_x + (target_x - start_x) * t)
         y = int(start_y + (target_y - start_y) * t)
-        
+
         ctypes.windll.user32.SetCursorPos(x, y)
         time.sleep(delay)
 
@@ -219,185 +242,179 @@ def press_key(vk_code: int) -> None:
 
 
 def type_text(text: str) -> None:
-    """Type text with natural human-like timing.
-    
-    Args:
-        text: Text to type
-    """
+    """Type text with natural human-like timing."""
     print(f'  → Typing: "{text}"')
-    
+
     for char in text:
         if char == ' ':
             press_key(0x20)  # VK_SPACE
-            time.sleep(TYPING_WORD_DELAY)  # Longer pause after spaces
+            time.sleep(TYPING_WORD_DELAY)
         elif char == '\n':
             press_key(0x0D)  # VK_RETURN
             time.sleep(TYPING_WORD_DELAY)
         else:
-            # Use Windows SendInput for proper character input
-            # This handles special characters and different keyboard layouts
-            ctypes.windll.user32.keybd_event(0, 0, 0, 0)  # Dummy to ensure focus
-            
-            # Convert character to virtual key and send
             vk = ctypes.windll.user32.VkKeyScanW(ord(char))
             if vk != -1:
-                # Check if shift is needed (high byte)
                 shift_needed = (vk >> 8) & 1
                 vk_code = vk & 0xFF
-                
+
                 if shift_needed:
                     ctypes.windll.user32.keybd_event(0x10, 0, 0, 0)  # Shift down
                     time.sleep(0.01)
-                
+
                 press_key(vk_code)
-                
+
                 if shift_needed:
                     ctypes.windll.user32.keybd_event(0x10, 0, 2, 0)  # Shift up
-            
+
             time.sleep(TYPING_CHAR_DELAY)
 
 
-def execute_action(cmd: str) -> None:
+def execute_action(func_name: str, params: list) -> None:
     """Execute action with smooth, human-like behavior."""
-    action_type, params = parse_action(cmd)
-    
     screen_w = ctypes.windll.user32.GetSystemMetrics(0)
     screen_h = ctypes.windll.user32.GetSystemMetrics(1)
-    
-    if action_type == "click" and len(params) == 2:
+
+    if func_name == "left_click" and len(params) == 2:
         target_x = int((params[0] / 1000.0) * screen_w)
         target_y = int((params[1] / 1000.0) * screen_h)
-        
+
         print(f"  → Moving to ({target_x}, {target_y})...")
         smooth_move_to(target_x, target_y)
         time.sleep(CLICK_SETTLE_DELAY)
-        
+
         print(f"  → Left clicking...")
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
         time.sleep(0.05)
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-    
-    elif action_type == "rightclick" and len(params) == 2:
+
+    elif func_name == "right_click" and len(params) == 2:
         target_x = int((params[0] / 1000.0) * screen_w)
         target_y = int((params[1] / 1000.0) * screen_h)
-        
+
         print(f"  → Moving to ({target_x}, {target_y})...")
         smooth_move_to(target_x, target_y)
         time.sleep(CLICK_SETTLE_DELAY)
-        
+
         print(f"  → Right clicking...")
         ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTDOWN
         time.sleep(0.05)
         ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTUP
-    
-    elif action_type == "doubleclick" and len(params) == 2:
+
+    elif func_name == "double_left_click" and len(params) == 2:
         target_x = int((params[0] / 1000.0) * screen_w)
         target_y = int((params[1] / 1000.0) * screen_h)
-        
+
         print(f"  → Moving to ({target_x}, {target_y})...")
         smooth_move_to(target_x, target_y)
         time.sleep(CLICK_SETTLE_DELAY)
-        
+
         print(f"  → Double clicking...")
-        # First click
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
         time.sleep(0.05)
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
-        time.sleep(0.08)  # Brief pause between clicks
-        # Second click
+        time.sleep(0.08)
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
         time.sleep(0.05)
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
-    
-    elif action_type == "drag" and len(params) == 4:
+
+    elif func_name == "drag" and len(params) == 4:
         x1 = int((params[0] / 1000.0) * screen_w)
         y1 = int((params[1] / 1000.0) * screen_h)
         x2 = int((params[2] / 1000.0) * screen_w)
         y2 = int((params[3] / 1000.0) * screen_h)
-        
+
         print(f"  → Moving to drag start ({x1}, {y1})...")
         smooth_move_to(x1, y1)
         time.sleep(0.1)
-        
+
         print(f"  → Grabbing...")
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
         time.sleep(0.1)
-        
+
         print(f"  → Dragging to ({x2}, {y2})...")
         start_x, start_y = get_cursor_position()
         for i in range(MOVEMENT_STEPS + 1):
             t = i / MOVEMENT_STEPS
             t = t * t * (3 - 2 * t)  # Smoothstep
-            
+
             x = int(start_x + (x2 - start_x) * t)
             y = int(start_y + (y2 - start_y) * t)
-            
+
             ctypes.windll.user32.SetCursorPos(x, y)
             time.sleep(STEP_DELAY)
-        
+
         print(f"  → Releasing...")
         time.sleep(0.1)
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
-    
-    elif action_type == "type" and len(params) == 1:
+
+    elif func_name == "type" and len(params) == 1:
         type_text(params[0])
+
+
+def _format_command(func_name: str, params: list) -> str:
+    """Format a parsed command back into its function-call string for logging/tracking."""
+    if func_name == "type":
+        return f'type("{params[0]}")'
+    return f"{func_name}({','.join(str(p) for p in params)})"
 
 
 def main() -> None:
     """Main automation loop."""
     dump_dir = Path("dump") / datetime.now().strftime("run_%Y%m%d_%H%M%S")
     dump_dir.mkdir(parents=True, exist_ok=True)
-    
+
     story = "FRANZ observing desktop."
     last_action = "init"
-    
+
     iteration = 0
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("FRANZ - Smooth Human-Like Automation Agent")
-    print("="*60)
+    print("=" * 60)
     print(f"Screenshots: {dump_dir}")
-    print(f"Movement: {MOVEMENT_STEPS} steps @ {STEP_DELAY*1000}ms = {MOVEMENT_STEPS*STEP_DELAY*1000}ms")
-    print(f"Click settle: {CLICK_SETTLE_DELAY*1000}ms")
-    print(f"Typing: {TYPING_CHAR_DELAY*1000}ms/char, {TYPING_WORD_DELAY*1000}ms/word")
-    print("="*60 + "\n")
-    
+    print(f"Movement: {MOVEMENT_STEPS} steps @ {STEP_DELAY * 1000}ms = {MOVEMENT_STEPS * STEP_DELAY * 1000}ms")
+    print(f"Click settle: {CLICK_SETTLE_DELAY * 1000}ms")
+    print(f"Typing: {TYPING_CHAR_DELAY * 1000}ms/char, {TYPING_WORD_DELAY * 1000}ms/word")
+    print("=" * 60 + "\n")
+
     while True:
         iteration += 1
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Iteration {iteration}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Story: {story}")
         print(f"Last: {last_action}")
-        
+
         draw_func = create_visualization(last_action)
         img = screenshot.capture_screen_png(TARGET_WIDTH, TARGET_HEIGHT, draw_func=draw_func)
-        
+
         timestamp = int(time.time() * 1000)
         (dump_dir / f"{timestamp}.png").write_bytes(img)
-        
+
         print("Sending to AI...")
         content = infer(img, story, last_action)
         print(f"AI response:\n{content}\n")
-        
+
         commands, story_candidate = parse_response(content)
-        
+
         if commands:
             print(f"Executing {len(commands)} command(s):")
-            for idx, cmd in enumerate(commands, 1):
-                print(f"\n[{idx}] {cmd}")
-                execute_action(cmd)
-                last_action = cmd
+            for idx, (func_name, params) in enumerate(commands, 1):
+                cmd_str = _format_command(func_name, params)
+                print(f"\n[{idx}] {cmd_str}")
+                execute_action(func_name, params)
+                last_action = cmd_str
                 time.sleep(0.2)
         else:
             print("Observing only (no commands)")
             last_action = "observe"
-        
+
         if story_candidate:
             story = story_candidate
             (dump_dir / "story.txt").write_text(story, encoding="utf-8")
             print(f"\nStory updated: {story}")
-        
+
         time.sleep(0.5)
 
 
