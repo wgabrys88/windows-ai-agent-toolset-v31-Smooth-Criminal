@@ -1,4 +1,3 @@
-```markdown
 # FRANZ - Autonomous Windows Automation Agent
 
 FRANZ is a vision-language model driven Windows automation system that observes, reasons, and interacts with the desktop environment through natural narrative-driven control loops.
@@ -73,6 +72,7 @@ All interactions use interpolated motion with smoothstep easing:
 ```python
 # DPI awareness setup
 shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+```
 
 # Capture flow
 1. GetSystemMetrics for screen dimensions
@@ -81,7 +81,7 @@ shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
 4. BGRA to RGBA conversion with forced alpha=255
 5. PNG encoding (manual IHDR/IDAT/IEND chunk construction)
 6. Optional drawing function injection before encoding
-```
+
 
 ### drawing.py
 
@@ -214,6 +214,4 @@ To add capabilities:
 ## License
 
 Implementation details specific to Windows automation research.
-```
-
 This README provides complete technical specification for reconstructing the system from scratch while documenting the narrative-driven architecture and smooth action implementation.
